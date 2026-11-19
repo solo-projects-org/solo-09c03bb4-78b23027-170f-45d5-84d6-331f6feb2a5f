@@ -105,3 +105,95 @@ class TradeState(BaseModel):
     price_cents: Optional[int]
     qty: Optional[int]
     cancelled: bool
+
+
+# ---------------------------------------------------------------------------
+# provenance / tracing
+# ---------------------------------------------------------------------------
+
+class TraceLeg(BaseModel):
+    """One trade's frozen (historical) or live (current) contribution to a minute."""
+
+    trade_no: str
+    revision: int
+    trade_time_utc_ms: int
+    price_cents: int
+    qty: int
+
+
+class TraceCause(BaseModel):
+    """The message whose commit produced this journal entry."""
+
+    trade_no: str
+    revision: int
+    op: Op
+    trade_time_utc_ms: Optional[int] = Field(description="该次提交后这笔成交的有效时刻（cancel 为 null）")
+    price_cents: Optional[int]
+    qty: Optional[int]
+    cancelled: bool
+    occurred_utc_ms: int = Field(description="服务端提交时刻，UTC 毫秒")
+
+
+class RemovedTrade(BaseModel):
+    trade_no: str
+    reason: Literal["cancelled", "moved_to_other_minute", "not_found"] = Field(
+        description="cancelled=当前状态已撤销; moved_to_other_minute=仍有效但已改到别的分钟; not_found=当前状态查无此笔"
+    )
+    last_known: TraceLeg
+
+
+class ChangedTrade(BaseModel):
+    trade_no: str
+    fields: list[Literal["revision", "trade_time_utc_ms", "price_cents", "qty"]]
+    historical: dict[str, int]
+    current: dict[str, int]
+
+
+class MinuteDiff(BaseModel):
+    removed: list[RemovedTrade] = Field(description="历史构成里有、现在该分钟已不在的成交")
+    appeared: list[TraceLeg] = Field(description="历史构成里没有、现在该分钟出现的成交")
+    changed: list[ChangedTrade] = Field(description="同一笔仍在，但修订/时刻/价格/股数被改过")
+
+
+class RelatedChange(BaseModel):
+    seq: int
+    type: Literal["upsert", "delete"]
+    minute_start_utc_ms: int
+
+
+class TraceEntry(BaseModel):
+    symbol: str
+    seq: int = Field(description="变更序号（journal seq）")
+    type: Literal["upsert", "delete"] = Field(description="该次变更对分钟柱的影响类型")
+    minute_start_utc_ms: int
+    bar: Optional[Bar] = Field(description="该次变更提交时的分钟柱；delete 为 null")
+    caused_by: Optional[TraceCause] = Field(
+        description="产生该变更的成交消息；本功能启用前写入的老变更没有溯源信息，为 null"
+    )
+    open_trade_no: Optional[str] = Field(description="历史构成中开盘价来源交易号")
+    close_trade_no: Optional[str] = Field(description="历史构成中收盘价来源交易号")
+    current_open_trade_no: Optional[str] = Field(description="现行构成中开盘价来源交易号（该分钟已清空则 null）")
+    current_close_trade_no: Optional[str] = Field(description="现行构成中收盘价来源交易号")
+    historical_trades: Optional[list[TraceLeg]] = Field(
+        description="提交当时该分钟的有效逐笔构成（冻结副本，不随现行逐笔变化）。"
+        "upsert 为提交后构成；delete 为提交前构成（即被删除的那些成交）"
+    )
+    composition_before_commit: Optional[list[TraceLeg]] = Field(
+        description="该次提交前该分钟的有效逐笔构成（冻结副本）"
+    )
+    composition_after_commit: Optional[list[TraceLeg]] = Field(
+        description="该次提交后该分钟的有效逐笔构成（冻结副本；delete 为空列表）"
+    )
+    current_trades: list[TraceLeg] = Field(description="同一读取事务内该分钟现行的有效逐笔构成")
+    diff: Optional[MinuteDiff] = Field(description="历史 → 现行的消失/出现/改值；历史不可用时为 null")
+    historical_available: bool = Field(description="本变更是否留存了历史构成")
+    related_changes: list[RelatedChange] = Field(
+        description="同一次提交产生的其他变更（跨分钟更正会有旧分钟与新分钟两条，各自可按 seq 追查）"
+    )
+
+
+class TraceList(BaseModel):
+    symbol: str
+    trade_no: str
+    changes: list[TraceEntry] = Field(description="该交易号触发的全部变更，按 seq 倒序")
+

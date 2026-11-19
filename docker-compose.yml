@@ -7,6 +7,7 @@ services:
       - "8000:8000"
     environment:
       FEED_DB_PATH: /data/feed.db
+      FEED_TRACE_ENABLED: "1"
     volumes:
       - feed-data:/data
     restart: unless-stopped

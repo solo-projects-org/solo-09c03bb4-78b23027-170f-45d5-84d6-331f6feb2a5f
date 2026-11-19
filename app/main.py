@@ -14,12 +14,19 @@ DESCRIPTION = """逐笔成交供数 API。
 * `GET /v1/symbols/{symbol}/bars` 风控首次查询：全量分钟柱 + 游标
 * `GET /v1/symbols/{symbol}/changes?cursor=N` 之后用游标续拉变动分钟
   （跨分钟更正会交付两个分钟的变化；最后一笔撤销返回 delete 删除标记）
+* `GET /v1/symbols/{symbol}/changes/{seq}` 按变更序号回溯：当时该分钟由哪些成交构成、
+  开收盘价来源，以及后来消失/出现/改值的逐笔
+* `GET /v1/symbols/{symbol}/trades/{trade_no}/changes` 按交易号列出它触发的全部变更
 """
 
 
 def create_app(db_path: str) -> FastAPI:
     db.init_db(db_path)
-    app = FastAPI(title="逐笔成交供数 API", version="1.0.0", description=DESCRIPTION)
+    # FEED_TRACE_ENABLED=0 turns provenance logging off for new writes; entries
+    # already written keep their frozen composition and remain queryable.
+    logic.TRACE_ENABLED = os.environ.get("FEED_TRACE_ENABLED", "1") not in ("0", "false", "False")
+    app = FastAPI(title="逐笔成交供数 API", version="1.1.0", description=DESCRIPTION)
+    app.state.db_path = db_path
 
     def get_conn():
         conn = db.connect(db_path)
@@ -70,6 +77,31 @@ def create_app(db_path: str) -> FastAPI:
     )
     def get_bars(symbol: str, conn=Depends(get_conn)):
         return logic.snapshot_bars(conn, symbol)
+
+    @app.get(
+        "/v1/symbols/{symbol}/changes/{seq}",
+        response_model=models.TraceEntry,
+        responses={404: {"description": "该股票下没有这个变更序号（或该序号不属于此股票）"}},
+        summary="按变更序号溯源：当时分钟构成 + 开收盘来源 + 后来的逐笔差异",
+    )
+    def get_change_trace(symbol: str, seq: int, conn=Depends(get_conn)):
+        entry = logic.trace_change(conn, symbol, seq)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="change seq not found for this symbol")
+        return entry
+
+    @app.get(
+        "/v1/symbols/{symbol}/trades/{trade_no}/changes",
+        response_model=models.TraceList,
+        summary="按交易号追查它触发的全部变更（含跨分钟更正的两条）",
+    )
+    def get_trade_traces(
+        symbol: str,
+        trade_no: str,
+        limit: int = Query(default=500, ge=1, le=5000),
+        conn=Depends(get_conn),
+    ):
+        return logic.trace_by_trade(conn, symbol, trade_no, limit)
 
     @app.get(
         "/v1/symbols/{symbol}/changes",

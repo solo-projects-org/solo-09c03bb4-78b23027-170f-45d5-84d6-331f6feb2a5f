@@ -27,6 +27,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 | POST | `/v1/trades` | 受理一条逐笔消息（成交/更正/撤销） |
 | GET | `/v1/symbols/{symbol}/bars` | 风控首次查询：该股票全部分钟柱 + 游标 |
 | GET | `/v1/symbols/{symbol}/changes?cursor=N&limit=500` | 用游标续拉变动分钟 |
+| GET | `/v1/symbols/{symbol}/changes/{seq}` | **按变更序号溯源**：当时该分钟构成 + 开收盘来源 + 后来差异 |
+| GET | `/v1/symbols/{symbol}/trades/{trade_no}/changes?limit=500` | **按交易号**列出它触发的全部变更（各条均可溯源） |
 | GET | `/v1/trades/{symbol}/{trade_no}` | 查看某笔逐笔当前状态（调试） |
 
 逐笔消息：
@@ -65,21 +67,67 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 （`BEGIN IMMEDIATE`），失败整体回滚；读取只在单事务里读已提交数据；
 WAL + `synchronous=FULL`，进程重启后已提交游标不会丢、不会跳号、不留半更新。
 
+## 分钟构成溯源
+
+对启用本功能后产生的每条 `upsert` / `delete` 变更，提交事务里**额外**冻结：
+
+* 该变更由哪条消息产生（交易号、修订号、op、成交时刻、价格、股数、服务端提交时刻）；
+* 该分钟**提交前**与**提交后**的有效逐笔构成（交易号、修订、成交时刻、价格、股数），
+  以及开/收盘价分别由哪笔成交提供。
+
+历史构成是**冻结副本**（`journal_trades` 独立存行），不引用 `trades`，
+因此后续任何更正/撤销都不会改写它。`delete` 变更的 `historical_trades`
+取"提交前"构成，即被删除掉的那些成交；`composition_after_commit` 为空列表。
+
+查询 `GET /v1/symbols/{symbol}/changes/{seq}` 返回：
+
+| 字段 | 含义 |
+|---|---|
+| `bar` / `type` | 该变更提交时的分钟柱（`delete` 为 null） |
+| `caused_by` | 触发本变更的消息及其该次提交的修订/时刻/价格/股数 |
+| `historical_trades` | 当时的逐笔构成（冻结） |
+| `composition_before_commit` / `composition_after_commit` | 提交前/后两份冻结构成 |
+| `open_trade_no` / `close_trade_no` | 当时开盘价/收盘价的来源交易号 |
+| `current_trades` / `current_open_trade_no` / `current_close_trade_no` | 现行同一分钟的构成与来源 |
+| `diff.removed` | 历史有、现在已不在：`cancelled`（当前状态确认已撤销）或 `moved_to_other_minute`（仍有效、已移至别的分钟） |
+| `diff.appeared` | 历史没有、现在该分钟出现 |
+| `diff.changed` | 同一笔仍在但修订/时刻/价格/股数改过，逐字段给历史值与现行值 |
+| `related_changes` | 同一次提交产生的另一条变更（跨分钟更正的两条各自可追） |
+| `historical_available` | 本功能启用前写入的老变更没有历史，为 `false`（绝不按现行状态倒推） |
+
+`GET /v1/symbols/{symbol}/trades/{trade_no}/changes` 按交易号列出全部相关变更（倒序），
+适合从"某笔成交"出发追它自己引发过的每次分钟变化。
+
+一致性：每次溯源查询在**一个读事务**内取历史构成、现行构成与现行逐笔状态，
+与并发更正要么完全在其之前、要么完全在其之后，历史与现行不会跨提交混读。
+历史构成、变更日志（含溯源行）与逐笔状态同一事务提交，写入失败或重启不会缺一份。
+
+开关：`FEED_TRACE_ENABLED=0` 只停止为新写入留痕；已留痕的历史继续可查。
+默认开启。老库升级无需迁移：溯源表 `CREATE TABLE IF NOT EXISTS` 自动建立。
+
 ## 自测
 
 ```bash
 .venv/bin/pip install pytest httpx
-python -m pytest tests/ -v        # 20 个关键场景用例
+python -m pytest tests/ -v        # 39 个关键场景用例
 ```
 
 覆盖：OHLCV 口径与同毫秒按交易号决胜、幂等重送、同修订冲突 409、迟到旧修订不回退、
 跳号受理、同分钟/跨分钟更正（两分钟交付）、最后一笔撤销的删除标记、游标续拉流程、
 游标超前 409、**重启后状态与游标连续**、**写入中途失败整体回滚**（monkeypatch 注入故障）、
-参数校验、未知逐笔撤销墓碑。
+参数校验、未知逐笔撤销墓碑；溯源侧：**历史构成不被后续更正覆盖**、开收盘来源、
+消失/出现/改值分类、撤销与移出确认、delete 留痕、**跨分钟更正两条变更各自可追且互相引用**、
+按交易号追查、同修订冲突/幂等重送不产生溯源、**读事务内历史与现行同一快照**
+（另开写连接中途提交更正）、**失败写入不留下孤立溯源**、重启后溯源仍在、老日志如实标记不可用、
+开关只影响新写入、OpenAPI 暴露端点。
 
 ## 限制与待办
 
 * SQLite 单写者：容器固定单 worker；多实例水平扩展需换外部数据库（接口与事务边界不变）
 * 未做鉴权/限流、数据保留期清理、批量提交接口
+* 溯源表按变更条数增长（每条约 1 行溯源 + 分钟构成副本），尚无归档策略
+* 未实现完整历史重放：溯源只能回答"某条已提交变更当时是什么"，无法重建未留痕的老日志
 * 本环境无 Docker 守护进程，镜像未实际构建；Dockerfile/compose 经静态检查，
-  同一入口（`uvicorn app.main:app`）已在本地用 venv 完整跑通上述场景
+  同一入口（`uvicorn app.main:app`）已在本地用 venv 完整跑通上述场景（含启动后 HTTP 实测
+  `/v1/trades`、`/v1/symbols/{symbol}/changes/{seq}`、`/trades/{trade_no}/changes`、
+  `/openapi.json` 及重启后溯源仍在）
